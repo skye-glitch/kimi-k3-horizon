@@ -1,7 +1,7 @@
-# Kimi K3 on TACC Vista GH200
+# Kimi K3 on TACC Horizon
 
-This repository serves `moonshotai/Kimi-K3` with SGLang across 32 Vista GH200
-nodes. The production checkpoint, 32-node startup, generation, 32K context, GPU
+This repository serves `moonshotai/Kimi-K3` with SGLang across Horizon nodes. 
+The production checkpoint, multi-node startup, generation, 32K context, GPU
 monitoring, and multi-turn chat path have been validated.
 
 Detailed bring-up history, failed experiments, measurements, and design choices
@@ -15,7 +15,8 @@ is the operational runbook.
 | `images/sglang-kimi-k3-cu12-74968e5653-arm64.sif` | ARM64 SGLang runtime image |
 | `models/Kimi-K3/` | Production checkpoint (96 shards, about 1.56 TB decimal) |
 | `slurm/download_k3.sbatch` | Resumable checkpoint download on a CPU node |
-| `slurm/serve_k3_32gh.sbatch` | Production 32-node serving job |
+| `slurm/serve_k3_32gh.sbatch` | Legacy 32-node serving job |
+| `slurm/server_k3_auto_kimi.sbatch` | Production 8-node job for automated Engram evaluation |
 | `scripts/preflight.sh` | Validate the image, index, and all checkpoint shards |
 | `scripts/chat.py`, `chat.sh` | Streaming multi-turn client and convenience wrapper |
 | `scripts/context_probe.py` | Exact-token long-context recall test |
@@ -27,18 +28,16 @@ from Git.
 
 ## Requirements and current profile
 
-Run Slurm commands from a Vista login node. The scripts load the required
+Run Slurm commands from a Horizon login node. The scripts load the required
 modules themselves. For direct Python, GPU, virtual-environment, or container
 work, load the modules in the same shell before use:
 
 ```bash
-module load gcc/13.2.0
-module load cuda/12.6
-module load python3/3.11.8
+module load gcc
+module load cuda
 module load tacc-apptainer
-```
 
-Do not add Vista's host `nccl` or `nvshmem` modules to the serving jobs. The
+Do not add Horizon's host `nccl` or `nvshmem` modules to the serving jobs. The
 container supplies the matching CUDA/NCCL stack and is launched with
 `--cleanenv`.
 
@@ -46,7 +45,7 @@ The production launcher currently uses:
 
 | Setting | Value |
 |---|---:|
-| Nodes / GPUs | 32 GH200 nodes, one GPU per node |
+| Nodes / GPUs | 8 nodes, one GPU per task |
 | Tensor / expert parallelism | TP32 / EP32 |
 | Context limit | 32,768 tokens |
 | Maximum running requests | 16 |
@@ -64,7 +63,7 @@ changes.
 
 ### 1. Prepare the image and checkpoint
 
-Clone the repository on Vista, enter its root directory, and obtain the runtime
+Clone the repository on Horizon, enter its root directory, and obtain the runtime
 image if it is not already present:
 
 ```bash
@@ -101,39 +100,19 @@ squeue -u "$USER"
 tail -f logs/JOBID/k3-download.out
 ```
 
-Downloading does not require a GPU; the job uses Vista's `gg` partition.
+### 2. Automated Evaluation with Engram
 
-### 2. Start the server
-
-```bash
-sbatch -A PROJECT_ID slurm/serve_k3_32gh.sbatch
-squeue -u "$USER"
-```
-
-The job requests 32 GH nodes for four hours. At the current `gh` rate this is
-32 SUs per running hour, up to 128 SUs if the full wall time is used. Replace
-`PROJECT_ID` with the allocation that should be charged.
-
-Follow startup and, when needed, query the rank-0 hostname:
+To run the full end-to-end evaluation pipeline, submit the automated Slurm script:
 
 ```bash
-tail -f logs/JOBID/k3-server.out
-squeue -h -j JOBID -t R -o '%B'
+sbatch slurm/server_k3_auto_kimi.sbatch
 ```
 
-Do not send requests merely because `/model_info` responds. Wait until the log
-contains both:
+This 8-node script (configured for the debug partition) is designed to streamline evaluation. It automatically launches the distributed Kimi SGLang server and, once the endpoints are healthy, seamlessly connects the server to the Kimi evaluation scripts located in the Engram directory. All subsequent benchmarking and generation tasks are handled sequentially within the job allocation, minimizing manual intervention and ensuring accurate metrics capture.
 
-```text
-K3 warmup and generation health check passed
-K3_HELLO_INFERENCE_TEST=PASS
-```
+### 3.Start a multi-turn conversation
 
-The server then remains active until it is cancelled or reaches its time limit.
-
-### 3. Start a multi-turn conversation
-
-From the Vista project directory, pass only the serving Job ID:
+From the Horizon project directory, pass only the serving Job ID:
 
 ```bash
 ./chat.sh JOBID
@@ -161,7 +140,7 @@ status, and timestamps.
 Do not expose port 30000 publicly. Create an SSH tunnel using the rank-0 host:
 
 ```bash
-ssh -L 30000:RANK0_HOST:30000 TACC_USERNAME@vista.tacc.utexas.edu
+ssh -L 30000:RANK0_HOST:30000 TACC_USERNAME@Horizon.tacc.utexas.edu
 ```
 
 Then address `http://127.0.0.1:30000/v1` from a local OpenAI-compatible client.
@@ -173,38 +152,12 @@ python3 scripts/client.py \
   --prompt 'Reply with exactly: ready'
 ```
 
-Running `chat.sh` on Vista is preferred when its CSV must be written directly
+Running `chat.sh` on Horizon is preferred when its CSV must be written directly
 into the shared per-job log directory.
 
-### 5. Measure context capacity (optional)
 
-Run this only after the server is ready:
 
-```bash
-module load gcc/13.2.0
-module load cuda/12.6
-module load python3/3.11.8
-
-python3 scripts/context_probe.py \
-  --job-id JOBID \
-  --base-url http://RANK0_HOST:30000/v1 \
-  --targets 4096,8192,16384,24576,30000,32000,32637 \
-  --max-tokens 128 \
-  --context-limit 32768 \
-  --timeout 1800
-
-python3 scripts/summarize_context_gpu.py --job-id JOBID
-```
-
-The probe flushes SGLang caches before each target by default so that lengths
-are measured independently. Use `--no-flush-cache` only when retained-cache
-behavior is intentionally being tested. Results are written to
-`k3-context.csv` and `k3-context-gpu-summary.csv` in the job directory.
-
-The prompt plus output budget and K3 chat-template overhead must fit within
-32,768 tokens. Reduce `--max-tokens` when testing extremely long prompts.
-
-### 6. Monitor and stop the job
+### 5. Monitor and stop the job
 
 Every serving job samples all 32 GPUs every 15 seconds. The interval can be
 changed at submission with `KIMI_GPU_MONITOR_INTERVAL`.
@@ -217,7 +170,7 @@ sacct -j JOBID -X -o JobID,State,Elapsed,AllocNodes,Start,End
 ```
 
 Cancel the allocation when it is no longer needed; idle servers are still
-charged for all 32 nodes.
+charged for all 8 nodes.
 
 ## Logs
 
@@ -227,7 +180,7 @@ is grouped by Slurm Job ID:
 ```text
 logs/JOBID/
 ├── k3-server.out
-├── k3-rank-0.out ... k3-rank-31.out
+├── k3-rank-0.out ... k3-rank-8.out
 ├── k3-gpu-monitor.out
 ├── k3-gpu.csv
 ├── k3-chat.csv                 # after interactive chat
@@ -248,7 +201,7 @@ Download jobs follow the same directory rule with a workload-specific filename.
 | OOM or Marlin workspace failure | Keep the validated 0.80 memory fraction and 4K prefill chunk; avoid retained-cache stress until idle |
 | One rank exits | Inspect the matching `k3-rank-RANK.out`; `srun --kill-on-bad-exit` will stop the distributed step |
 
-Vista provides one GH200 per node and no inter-GPU NVLink between these nodes.
+Horizon provides one GH200 per node and no inter-GPU NVLink between these nodes.
 Autoregressive generation therefore communicates over InfiniBand and has much
 higher latency than a multi-GPU NVSwitch server.
 
@@ -260,4 +213,4 @@ TB checkpoint. Review the Kimi K3 license before public or commercial serving.
 - [Moonshot Kimi K3 model card](https://huggingface.co/moonshotai/Kimi-K3)
 - [Moonshot Kimi K3 repository and license](https://github.com/MoonshotAI/Kimi-K3)
 - [SGLang Kimi K3 cookbook](https://docs.sglang.io/cookbook/autoregressive/Moonshotai/Kimi-K3)
-- [TACC Vista documentation](https://docs.tacc.utexas.edu/hpc/vista/)
+- [TACC Horizon documentation](https://docs.tacc.utexas.edu/hpc/Horizon/)

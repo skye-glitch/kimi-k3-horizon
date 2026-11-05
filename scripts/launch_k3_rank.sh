@@ -101,11 +101,11 @@ exec apptainer exec \
         --mamba-full-memory-ratio 0.45 \
         --mamba-ssm-dtype bfloat16 \
         --mamba-radix-cache-strategy extra_buffer_lazy \
-        --kv-cache-dtype fp8_e4m3 \
+        --kv-cache-dtype bf16 \
         --mem-fraction-static 0.80 \
-        --context-length 32768 \
+        --context-length 196608 \
         --chunked-prefill-size 8192 \
-        --max-running-requests 32 \
+        --max-running-requests 8 \
         --mm-feature-transport cpu \
         --cuda-graph-backend-decode disabled \
         --cuda-graph-backend-prefill disabled \

@@ -5,10 +5,13 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=72
 #SBATCH --exclusive
-#SBATCH --time=14:00:00
+#SBATCH --time=48:00:00
 #SBATCH --output=/dev/null
 #SBATCH -A ASC26075
 #SBATCH -p debug
+#SBATCH --mail-user=sli@tacc.utexas.edu  
+#SBATCH --mail-type=BEGIN,END,FAIL 
+#SBATCH --exclude=c108-009,c106-029
 
 root_dir=${KIMI_K3_ROOT:-${SLURM_SUBMIT_DIR:?SLURM_SUBMIT_DIR is required}}
 job_id=${SLURM_JOB_ID:?SLURM_JOB_ID is required}
