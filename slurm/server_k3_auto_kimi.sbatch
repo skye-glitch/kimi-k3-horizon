@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=k3-sglang
-#SBATCH --nodes=8
-#SBATCH --ntasks=8
+# 4 nodes = TP16/EP16 test setup (shorter queue). For full TP32/EP32 run:
+#   sbatch --nodes=8 --ntasks=8 slurm/server_k3_auto_kimi.sbatch
+#SBATCH --nodes=4
+#SBATCH --ntasks=4
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=72
 #SBATCH --exclusive
-#SBATCH --time=24:00:00
+#SBATCH --time=01:00:00
 #SBATCH --output=/dev/null
 #SBATCH -A ASC26075
 #SBATCH -p debug
@@ -24,6 +26,15 @@ cd "$KIMI_JOB_LOG_DIR"
 module load gcc
 module load cuda
 module load tacc-apptainer
+
+# Keep caches off the small $HOME quota; srun ranks and the Engram benchmark inherit these.
+export KIMI_CACHE_ROOT=${KIMI_CACHE_ROOT:-/scratch/07980/sli4/apptainer_cache}
+export APPTAINER_CACHEDIR="$KIMI_CACHE_ROOT"
+export XDG_CACHE_HOME="$KIMI_CACHE_ROOT/xdg"
+export CUDA_CACHE_PATH="$KIMI_CACHE_ROOT/nv/ComputeCache"
+export TRITON_CACHE_DIR="$KIMI_CACHE_ROOT/triton"
+export TVM_FFI_CACHE_DIR="$KIMI_CACHE_ROOT/tvm-ffi"
+export FLASHINFER_WORKSPACE_BASE="$KIMI_CACHE_ROOT"
 
 set -euo pipefail
 
@@ -51,11 +62,14 @@ export MASTER_ADDR
 MASTER_ADDR=$(ip -4 -o addr show ibs2 | awk '{sub(/\/.*/, "", $4); print $4; exit}')
 [[ -n "$MASTER_ADDR" ]] || { echo "Could not resolve rank-0 ibs2 address." >&2; exit 2; }
 
+export GLOO_SOCKET_IFNAME=ibs2
+export NCCL_SOCKET_IFNAME=ibs2
+
 echo "K3 rank-0 host: $(hostname)"
 echo "K3 rank-0 IB address: $MASTER_ADDR"
 echo "OpenAI-compatible endpoint after startup: http://$(hostname):30000/v1"
 echo "Startup timeout: ${KIMI_STARTUP_TIMEOUT}s; Hello timeout: ${KIMI_HELLO_TIMEOUT}s"
-echo "This four-hour 8-node validation job costs at most 32 Horizon SUs."
+echo "Nodes: $SLURM_NNODES (TP/EP size $((SLURM_NNODES * 4)))"
 
 gpu_csv="$KIMI_JOB_LOG_DIR/k3-gpu.csv"
 gpu_monitor_log="$KIMI_JOB_LOG_DIR/k3-gpu-monitor.out"
@@ -69,8 +83,8 @@ echo "GPU monitoring: every ${KIMI_GPU_MONITOR_INTERVAL}s -> $gpu_csv"
 echo "GPU monitor log: $gpu_monitor_log"
 
 srun \
-    --nodes=8 \
-    --ntasks=8 \
+    --nodes="$SLURM_NNODES" \
+    --ntasks="$SLURM_NNODES" \
     --ntasks-per-node=1 \
     --cpus-per-task=72 \
     --kill-on-bad-exit=1 \
