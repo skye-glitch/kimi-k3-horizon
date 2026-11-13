@@ -2,6 +2,7 @@
 /images/
 /logs/
 /models/
+/nccl/
 
 __pycache__/
 *.py[cod]

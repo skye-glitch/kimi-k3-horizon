@@ -7,7 +7,8 @@
 # contains run_event_loop; dumps during weight loading do not), this script saves:
 #   threads-<proc>.txt  every thread's state, wait channel and CPU time, sampled twice
 #                       5 s apart (a thread that is spinning gains CPU time, a blocked one does not)
-#   gdb-<proc>.txt      native backtraces of all threads (gdb from the SGLang image)
+#   gdb-<proc>.txt      native backtraces of all threads (host gdb, reading the
+#                       container's libraries through /proc/<pid>/root)
 #   ib.txt              InfiniBand port and hardware counters that changed between two samples
 #   gpu.txt             nvidia-smi utilization and memory
 #   meta.txt            host, time, ptrace policy, scheduler PIDs
@@ -15,7 +16,9 @@
 #
 # Usage: hang_catcher.sh LOG_FILE WATCH_PID OUT_DIR IMAGE NODE_RANK
 # Environment: KIMI_HANG_CAPTURES (default 2), KIMI_HANG_GDB_TIMEOUT (default 180 s),
-#              KIMI_HANG_GDB=image|host (default image), KIMI_HANG_POLL (default 15 s).
+#              KIMI_HANG_GDB=host|image (default host), KIMI_HANG_POLL (default 15 s).
+#              The image's gdb cannot attach: apptainer exec starts it in a new user
+#              namespace ("ptrace: Inappropriate ioctl for device", job 92306).
 
 set -uo pipefail
 
@@ -26,7 +29,7 @@ image_path=$4
 node_rank=$5
 max_captures=${KIMI_HANG_CAPTURES:-2}
 gdb_timeout=${KIMI_HANG_GDB_TIMEOUT:-180}
-gdb_mode=${KIMI_HANG_GDB:-image}
+gdb_mode=${KIMI_HANG_GDB:-host}
 poll_seconds=${KIMI_HANG_POLL:-15}
 min_gap_seconds=120
 loop_window_seconds=120

@@ -64,6 +64,26 @@ if [[ "$host_tvm_ffi_cache" != "$root_dir" &&
     bind_args+=(--bind "$host_tvm_ffi_cache:$host_tvm_ffi_cache")
 fi
 
+# NCCL override. The image's NCCL 2.28.9 deadlocked in its proxy after 1.5-2.5 h of
+# serving in jobs 91870, 92084 and 92306: one rank's main thread spins in
+# ncclLocalOpAppend waiting for a free proxy-op slot while its proxy threads sleep in
+# ncclProxyGetPostedOps with nothing posted. The same stacks on 2.28.9 are reported
+# fixed in 2.30.7 (github.com/ashhart/TensorFold/issues/1060). nccl/2.30.7/ holds
+# libnccl.so.2 from the nvidia-nccl-cu13 2.30.7 aarch64 wheel (built for CUDA 13.3,
+# the nodes' driver level). It is bound over both copies in the image: PyTorch's
+# (also what SGLang's pynccl dlopens) and the system one. KIMI_NCCL_LIB=image keeps
+# the image's own; any other value is a path to a libnccl.so.2 to use instead.
+nccl_lib=${KIMI_NCCL_LIB:-$root_dir/nccl/2.30.7/libnccl.so.2}
+if [[ "$nccl_lib" != image ]]; then
+    [[ -r "$nccl_lib" ]] || { echo "Missing NCCL library: $nccl_lib (KIMI_NCCL_LIB=image uses the image's own)." >&2; exit 2; }
+    torch_nccl=/usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib/libnccl.so.2
+    bind_args+=(--bind "$nccl_lib:$torch_nccl:ro"
+                --bind "$nccl_lib:/usr/lib/aarch64-linux-gnu/libnccl.so.2.28.3:ro")
+    export APPTAINERENV_SGLANG_NCCL_SO_PATH="$torch_nccl"
+fi
+# Name NCCL's threads ("NCCL Progress", "NCCL Service", ...) so hang captures show them.
+export APPTAINERENV_NCCL_SET_THREAD_NAME=1
+
 host_ip=$(ip -4 -o addr show ibs2 | awk '{sub(/\/.*/, "", $4); print $4; exit}')
 [[ -n "$host_ip" ]] || { echo "Could not resolve ibs2 IPv4 address." >&2; exit 2; }
 
@@ -100,7 +120,7 @@ export APPTAINERENV_TORCHINDUCTOR_CACHE_DIR="/tmp/kimi_k3_inductor_${SLURM_JOB_I
 export APPTAINERENV_TORCH_DISTRIBUTED_TIMEOUT=7200
 export APPTAINERENV_NCCL_TIMEOUT=7200
 
-echo "rank=$node_rank host=$(hostname) ib=$host_ip master=$master_addr tvm_ffi_cache=$host_tvm_ffi_cache model_load_threads=$model_load_threads shard_stagger=1"
+echo "rank=$node_rank host=$(hostname) ib=$host_ip master=$master_addr tvm_ffi_cache=$host_tvm_ffi_cache model_load_threads=$model_load_threads shard_stagger=1 nccl_lib=$nccl_lib"
 echo "timeouts: soft_watchdog=${soft_watchdog_timeout}s dist=${dist_timeout}s watchdog=${watchdog_timeout}s"
 
 # Per-node hang catcher. py-spy shows only Python threads, but jobs 91870 and 92084

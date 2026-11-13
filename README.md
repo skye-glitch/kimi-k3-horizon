@@ -14,6 +14,7 @@ is the operational runbook.
 |---|---|
 | `images/sglang-kimi-k3-cu12-74968e5653-arm64.sif` | ARM64 SGLang runtime image |
 | `models/Kimi-K3/` | Production checkpoint (96 shards, about 1.56 TB decimal) |
+| `nccl/2.30.7/` | `libnccl.so.2` from the `nvidia-nccl-cu13` 2.30.7 aarch64 wheel, used in place of the image's NCCL 2.28.9 (see Troubleshooting) |
 | `slurm/download_k3.sbatch` | Resumable checkpoint download on a CPU node |
 | `slurm/serve_k3_32gh.sbatch` | Legacy 32-node serving job |
 | `slurm/server_k3_auto_kimi.sbatch` | Serving job (4 nodes by default, or 8) that also runs the Engram Kimi benchmark |
@@ -25,8 +26,8 @@ is the operational runbook.
 | `scripts/summarize_context_gpu.py` | Join context results with GPU samples |
 | `logs/JOBID/` | All outputs and CSV files for one Slurm job |
 
-The runtime image, checkpoint, caches, and logs are local artifacts excluded
-from Git.
+The runtime image, checkpoint, NCCL library, caches, and logs are local artifacts
+excluded from Git.
 
 ## Requirements and current profile
 
@@ -41,8 +42,21 @@ module load tacc-apptainer
 ```
 
 Do not add Horizon's host `nccl` or `nvshmem` modules to the serving jobs. The
-container supplies the matching CUDA/NCCL stack and is launched with
-`--cleanenv`.
+container supplies the CUDA stack and is launched with `--cleanenv`. NCCL is the
+one exception: the launcher binds `nccl/2.30.7/libnccl.so.2` over the image's
+NCCL 2.28.9. To set it up on a new checkout (about 250 MB):
+
+```bash
+mkdir -p nccl/2.30.7 && cd nccl/2.30.7
+pip download --no-deps --platform manylinux_2_18_aarch64 --only-binary=:all: nvidia-nccl-cu13==2.30.7
+python3 -m zipfile -e nvidia_nccl_cu13-2.30.7-*.whl wheel
+cp wheel/nvidia/nccl/lib/libnccl.so.2 wheel/nvidia_nccl_cu13-2.30.7.dist-info/licenses/License.txt .
+rm -rf wheel nvidia_nccl_cu13-2.30.7-*.whl
+```
+
+`KIMI_NCCL_LIB=image` uses the image's NCCL instead, and any other value is a path
+to a `libnccl.so.2`. Each `k3-rank-*.out` prints `nccl_lib=` and NCCL's own
+`NCCL version` line, so you can confirm which one ran.
 
 The launcher (`scripts/launch_k3_rank.sh`) currently uses:
 
@@ -274,7 +288,7 @@ Download jobs follow the same directory rule with a workload-specific filename.
 | GPU memory remains high after a request | Finished radix/Mamba/CUDA cache can remain reserved; inspect trends rather than one sample |
 | OOM or Marlin workspace failure | Keep the 0.80 memory fraction and 8K prefill chunk the launcher uses; avoid retained-cache stress until idle |
 | One rank exits | Inspect the matching `k3-rank-RANK.out`; `srun --kill-on-bad-exit` will stop the distributed step |
-| Server stops making progress 75 minutes to about 2 h 20 min after start (an NCCL all-reduce hangs) | Not yet fixed. In jobs 91870 and 92084, TP11's CPU was stuck in `ncclLocalOpAppend`: NCCL's proxy thread had stopped draining its queue, and the other ranks waited for it. Three sources of evidence: (1) `grep -n "Pyspy dump" logs/JOBID/k3-rank-*.out` shows each rank's Python stack (dumps during weight loading at startup are normal); (2) `logs/JOBID/nccl_trace_rank*` are PyTorch flight-recorder pickles, and the rank whose `last_enqueued_collective` is lowest is the one that fell behind; (3) `logs/JOBID/hang-capture/rankN-M/` comes from `scripts/hang_catcher.sh`, which, when the soft watchdog fires while serving, saves every thread's state, CPU time over 5 s and native gdb stack (NCCL's proxy thread included), plus InfiniBand counter changes and `nvidia-smi`. Timeouts (240/600/900 s by default): `KIMI_SOFT_WATCHDOG_TIMEOUT`, `KIMI_DIST_TIMEOUT`, `KIMI_WATCHDOG_TIMEOUT`. `KIMI_HANG_CATCHER=0` turns the catcher off. Lines longer than 4,000 characters in `k3-rank-*.out` (the watchdog's `leaked_full_pages` sets and request `input_ids`) are cut, with a note saying how much; `KIMI_LOG_LINE_MAX` changes the limit |
+| Server stops making progress 75 minutes to about 2 h 20 min after start (an NCCL all-reduce hangs) | Seen with the image's NCCL 2.28.9 in jobs 91870, 92084 and 92306. One rank's main thread spins in `ncclLocalOpAppend` waiting for a free proxy-op slot, while its NCCL proxy threads sleep in `ncclProxyGetPostedOps` with nothing posted, and the other ranks wait for it. The same stacks on 2.28.9 are [reported fixed in 2.30.7](https://github.com/ashhart/TensorFold/issues/1060), so the launcher now uses NCCL 2.30.7 (see Requirements); whether that fixes this deployment is not yet confirmed. Evidence if it recurs: (1) `grep -n "Pyspy dump" logs/JOBID/k3-rank-*.out` shows each rank's Python stack (dumps during weight loading at startup are normal); (2) `logs/JOBID/nccl_trace_rank*` are PyTorch flight-recorder pickles, and the rank whose `last_enqueued_collective` is lowest is the one that fell behind; (3) `logs/JOBID/hang-capture/rankN-M/` comes from `scripts/hang_catcher.sh`, which, when the soft watchdog fires while serving, saves every thread's state, CPU time over 5 s and native gdb stack (NCCL's proxy threads included, named because the launcher sets `NCCL_SET_THREAD_NAME=1`), plus InfiniBand counter changes and `nvidia-smi`. Timeouts (240/600/900 s by default): `KIMI_SOFT_WATCHDOG_TIMEOUT`, `KIMI_DIST_TIMEOUT`, `KIMI_WATCHDOG_TIMEOUT`. `KIMI_HANG_CATCHER=0` turns the catcher off. Lines longer than 4,000 characters in `k3-rank-*.out` (the watchdog's `leaked_full_pages` sets and request `input_ids`) are cut, with a note saying how much; `KIMI_LOG_LINE_MAX` changes the limit |
 
 Horizon's Grace Blackwell nodes use the GB200 NVL4 platform. Each node has 4
 Blackwell GPUs with 185 GiB of HBM3 each, and 2 Grace CPUs with 478 GiB of LPDDR5X
