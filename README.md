@@ -16,7 +16,8 @@ is the operational runbook.
 | `models/Kimi-K3/` | Production checkpoint (96 shards, about 1.56 TB decimal) |
 | `slurm/download_k3.sbatch` | Resumable checkpoint download on a CPU node |
 | `slurm/serve_k3_32gh.sbatch` | Legacy 32-node serving job |
-| `slurm/server_k3_auto_kimi.sbatch` | Production 8-node job for automated Engram evaluation |
+| `slurm/server_k3_auto_kimi.sbatch` | Serving job (4 nodes by default, or 8) that also runs the Engram Kimi benchmark |
+| `scripts/launch_k3_rank.sh` | Per-node SGLang launcher that `srun` starts on every node |
 | `scripts/preflight.sh` | Validate the image, index, and all checkpoint shards |
 | `scripts/chat.py`, `chat.sh` | Streaming multi-turn client and convenience wrapper |
 | `scripts/context_probe.py` | Exact-token long-context recall test |
@@ -36,22 +37,23 @@ work, load the modules in the same shell before use:
 module load gcc
 module load cuda
 module load tacc-apptainer
+```
 
 Do not add Horizon's host `nccl` or `nvshmem` modules to the serving jobs. The
 container supplies the matching CUDA/NCCL stack and is launched with
 `--cleanenv`.
 
-The production launcher currently uses:
+The launcher (`scripts/launch_k3_rank.sh`) currently uses:
 
 | Setting | Value |
 |---|---:|
-| Nodes / GPUs | 8 nodes, one GPU per task |
-| Tensor / expert parallelism | TP32 / EP32 |
-| Context limit | 32,768 tokens |
-| Maximum running requests | 16 |
-| Chunked prefill | 4,096 tokens |
+| Nodes / GPUs | 4 nodes (default) or 8 nodes of GB200 NVL4; one task per node, 4 Blackwell GPUs (185 GiB HBM3) each |
+| Tensor / expert parallelism | TP16 / EP16 on 4 nodes, TP32 / EP32 on 8 nodes |
+| Context limit | 196,608 tokens |
+| Maximum running requests | 8 |
+| Chunked prefill | 8,192 tokens |
 | Static memory fraction | 0.80 |
-| KV cache | FP8 E4M3 |
+| KV cache | BF16 |
 | KDA/Mamba state | BF16 |
 | CUDA graphs | Disabled |
 | API | OpenAI-compatible, rank 0 port 30000 |
@@ -100,17 +102,83 @@ squeue -u "$USER"
 tail -f logs/JOBID/k3-download.out
 ```
 
-### 2. Automated Evaluation with Engram
+### 2. Launch the server and the Engram benchmark
 
-To run the full end-to-end evaluation pipeline, submit the automated Slurm script:
+`slurm/server_k3_auto_kimi.sbatch` starts the K3 server and, once it is healthy,
+runs the Engram Kimi benchmark (PageIndex vs. LightRAG) inside the same job.
+
+**Before the first run**
+
+- **Engram checkout.** The job runs the benchmark from the Engram path hardcoded
+  near the end of the sbatch script (`cd /scratch/07980/sli4/Engram`). Edit that
+  line and the `Logs available at` line below it if your checkout is elsewhere.
+  That checkout needs its environment installed (`uv sync`), a `.env` with the
+  Tejas embedding settings, and the benchmark data. See
+  `playground/graph_rag/README.md` in Engram.
+- **Caches.** The job keeps the FlashInfer, tvm-ffi, CUDA, Triton and XDG caches
+  in `KIMI_CACHE_ROOT` (default `/scratch/07980/sli4/apptainer_cache`) instead of
+  `$HOME`, which has a small quota. Set it to your own scratch directory:
+  `export KIMI_CACHE_ROOT=$SCRATCH/apptainer_cache` before `sbatch`.
+- **Account and email.** Change `#SBATCH -A`, `--mail-user` and `--mail-type` in
+  the script to your allocation and address.
+
+**Submit**
+
+Run `sbatch` from the repository root. The job uses its submit directory as the
+repository root, so the model, image and logs paths depend on it.
 
 ```bash
+cd /path/to/kimi-k3-vista
 sbatch slurm/server_k3_auto_kimi.sbatch
 ```
 
-This 8-node script (configured for the debug partition) is designed to streamline evaluation. It automatically launches the distributed Kimi SGLang server and, once the endpoints are healthy, seamlessly connects the server to the Kimi evaluation scripts located in the Engram directory. All subsequent benchmarking and generation tasks are handled sequentially within the job allocation, minimizing manual intervention and ensuring accurate metrics capture.
+The defaults are 4 nodes (TP16/EP16) for 1 hour in the `debug` partition. Values
+given to `sbatch` on the command line override the `#SBATCH` lines:
 
-### 3.Start a multi-turn conversation
+```bash
+sbatch --time=04:00:00 slurm/server_k3_auto_kimi.sbatch          # longer run
+sbatch --nodes=8 --ntasks=8 slurm/server_k3_auto_kimi.sbatch     # TP32/EP32
+sbatch -A PROJECT_ID slurm/server_k3_auto_kimi.sbatch            # other allocation
+```
+
+Only 4 or 8 nodes are accepted: TP8 on 2 nodes does not fit in GPU memory. To
+raise the time of a job that is still pending without losing its place in the
+queue, use `scontrol update JobId=JOBID TimeLimit=04:00:00`.
+
+**Choosing a time limit**
+
+- Job priority on Horizon does not depend on the requested time. Before choosing,
+  compare start estimates with
+  `sbatch --test-only --time=HH:MM:SS slurm/server_k3_auto_kimi.sbatch`.
+- Startup takes about 11 minutes on 4 nodes, so longer jobs leave more of their
+  time for the benchmark.
+- The server stays up until the time limit, even after the benchmark finishes,
+  and the whole allocation is charged.
+- A job that would overlap a maintenance reservation does not start. Close to a
+  maintenance window, add `--time-min=00:15:00` so Slurm can shorten the job to
+  fit.
+
+**What the job does**
+
+1. Runs `scripts/preflight.sh`, then starts SGLang on every node through `srun`.
+2. Waits for `/health_generate` (`KIMI_STARTUP_TIMEOUT`, default 7200 s), then
+   sends a Hello request (`KIMI_HELLO_TIMEOUT`, default 1800 s). When it passes,
+   `k3-server.out` prints `K3_HELLO_INFERENCE_TEST=PASS`.
+3. Starts Engram's `playground/graph_rag/run_evaluation_kimi.sh JOBID` in the
+   background. The benchmark checkpoints its progress, so the next job resumes
+   where this one stopped.
+
+**Follow progress**
+
+```bash
+squeue -u "$USER"
+tail -f logs/JOBID/k3-server.out                 # startup and Hello test
+tail -f logs/JOBID/k3-rank-0.out                 # SGLang rank 0 and requests
+tail -f /path/to/Engram/log/evaluation_kimi.log  # benchmark scores
+tail -f /path/to/Engram/log/api_graph_kimi.log   # LightRAG ingest
+```
+
+### 3. Start a multi-turn conversation
 
 From the Horizon project directory, pass only the serving Job ID:
 
@@ -159,7 +227,7 @@ into the shared per-job log directory.
 
 ### 5. Monitor and stop the job
 
-Every serving job samples all 32 GPUs every 15 seconds. The interval can be
+Every serving job samples all of its GPUs every 15 seconds. The interval can be
 changed at submission with `KIMI_GPU_MONITOR_INTERVAL`.
 
 ```bash
@@ -170,7 +238,7 @@ sacct -j JOBID -X -o JobID,State,Elapsed,AllocNodes,Start,End
 ```
 
 Cancel the allocation when it is no longer needed; idle servers are still
-charged for all 8 nodes.
+charged for every node in the job.
 
 ## Logs
 
@@ -180,7 +248,8 @@ is grouped by Slurm Job ID:
 ```text
 logs/JOBID/
 ├── k3-server.out
-├── k3-rank-0.out ... k3-rank-8.out
+├── k3-rank-0.out ... k3-rank-N.out   # one per node
+├── nccl_trace_rank*                # only after an NCCL timeout
 ├── k3-gpu-monitor.out
 ├── k3-gpu.csv
 ├── k3-chat.csv                 # after interactive chat
@@ -198,12 +267,15 @@ Download jobs follow the same directory rule with a workload-specific filename.
 | Client waits but rank 0 shows no POST | Verify the rank-0 hostname, base URL, port, and SSH tunnel |
 | HTTP 400 context-length error | Reduce prompt history or `--max-tokens` |
 | GPU memory remains high after a request | Finished radix/Mamba/CUDA cache can remain reserved; inspect trends rather than one sample |
-| OOM or Marlin workspace failure | Keep the validated 0.80 memory fraction and 4K prefill chunk; avoid retained-cache stress until idle |
+| OOM or Marlin workspace failure | Keep the 0.80 memory fraction and 8K prefill chunk the launcher uses; avoid retained-cache stress until idle |
 | One rank exits | Inspect the matching `k3-rank-RANK.out`; `srun --kill-on-bad-exit` will stop the distributed step |
 
-Horizon provides one GH200 per node and no inter-GPU NVLink between these nodes.
-Autoregressive generation therefore communicates over InfiniBand and has much
-higher latency than a multi-GPU NVSwitch server.
+Horizon's Grace Blackwell nodes use the GB200 NVL4 platform. Each node has 4
+Blackwell GPUs with 185 GiB of HBM3 each, and 2 Grace CPUs with 478 GiB of LPDDR5X
+and 72 cores each. NVLink connects the 4 GPUs inside a node, and nodes talk to each
+other over InfiniBand (`ibs2`). TP16 spans 4 nodes and TP32 spans 8, so every
+decode step's collectives cross InfiniBand. Expect much higher per-token latency
+than on a single NVSwitch server.
 
 `$SCRATCH` is purgeable. Maintain a retention or re-download plan for the 1.56
 TB checkpoint. Review the Kimi K3 license before public or commercial serving.
