@@ -269,6 +269,7 @@ Download jobs follow the same directory rule with a workload-specific filename.
 | GPU memory remains high after a request | Finished radix/Mamba/CUDA cache can remain reserved; inspect trends rather than one sample |
 | OOM or Marlin workspace failure | Keep the 0.80 memory fraction and 8K prefill chunk the launcher uses; avoid retained-cache stress until idle |
 | One rank exits | Inspect the matching `k3-rank-RANK.out`; `srun --kill-on-bad-exit` will stop the distributed step |
+| Server stops making progress after about 75–80 minutes (an NCCL all-reduce hangs) | Not yet fixed. Each `k3-rank-*.out` should contain `soft_watchdog_timeout` py-spy dumps for its stuck ranks (`grep -n "Pyspy dump" logs/JOBID/k3-rank-*.out`), and `logs/JOBID/nccl_trace_rank*` holds each rank's recent collectives. Compare collective sequence numbers across ranks to find the one that fell behind. To change the timeouts (240/600/900 s by default), export `KIMI_SOFT_WATCHDOG_TIMEOUT`, `KIMI_DIST_TIMEOUT` or `KIMI_WATCHDOG_TIMEOUT` before `sbatch` |
 
 Horizon's Grace Blackwell nodes use the GB200 NVL4 platform. Each node has 4
 Blackwell GPUs with 185 GiB of HBM3 each, and 2 Grace CPUs with 478 GiB of LPDDR5X

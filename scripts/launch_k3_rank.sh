@@ -10,6 +10,22 @@ master_addr=${MASTER_ADDR:?MASTER_ADDR must be the rank-0 InfiniBand address}
 node_rank=${SLURM_PROCID:?This script must run under srun}
 node_count=${SLURM_NNODES:?This script must run inside a Slurm job}
 model_load_threads=${KIMI_MODEL_LOAD_THREADS:-2}
+# Hang diagnostics (job 91870 stalled in an NCCL all-reduce about 79 min in, and only
+# one rank's stack was dumped). Order matters. At 240 s, the soft watchdog makes every
+# rank stuck in a forward pass dump its own stack and keep running. At 600 s, the NCCL
+# process groups (--dist-timeout sets their timeout) time out, and the flight recorder
+# (TORCH_NCCL_DUMP_ON_TIMEOUT below) writes every rank's recent collectives. The hard
+# watchdog at 900 s is the last resort. SGLang's gloo CPU groups keep their own
+# fixed 120-minute timeout.
+soft_watchdog_timeout=${KIMI_SOFT_WATCHDOG_TIMEOUT:-240}
+dist_timeout=${KIMI_DIST_TIMEOUT:-600}
+watchdog_timeout=${KIMI_WATCHDOG_TIMEOUT:-900}
+for timeout_value in "$soft_watchdog_timeout" "$dist_timeout" "$watchdog_timeout"; do
+    if ! [[ "$timeout_value" =~ ^[1-9][0-9]*$ ]]; then
+        echo "KIMI_SOFT_WATCHDOG_TIMEOUT, KIMI_DIST_TIMEOUT and KIMI_WATCHDOG_TIMEOUT must be positive integers; got $timeout_value." >&2
+        exit 2
+    fi
+done
 
 # Each GB200 node has 4 GPUs (~182 GB usable each). The MXFP4 checkpoint needs
 # ~58.6 GB/GPU at TP32, ~117 GB/GPU at TP16; TP8 (2 nodes, ~234 GB/GPU) cannot fit.
@@ -85,6 +101,7 @@ export APPTAINERENV_TORCH_DISTRIBUTED_TIMEOUT=7200
 export APPTAINERENV_NCCL_TIMEOUT=7200
 
 echo "rank=$node_rank host=$(hostname) ib=$host_ip master=$master_addr tvm_ffi_cache=$host_tvm_ffi_cache model_load_threads=$model_load_threads shard_stagger=1"
+echo "timeouts: soft_watchdog=${soft_watchdog_timeout}s dist=${dist_timeout}s watchdog=${watchdog_timeout}s"
 
 # Vista's GH200 nodes expose one 96 GiB Hopper GPU each.  This adapts SGLang's
 # published 32-GPU H100 TP32/EP32 profile to 32 single-GPU, 400-Gb/s-IB nodes.
@@ -109,8 +126,9 @@ exec apptainer exec \
         --nnodes "$node_count" \
         --node-rank "$node_rank" \
         --dist-init-addr "$master_addr:20000" \
-        --dist-timeout 7200 \
-        --watchdog-timeout 300 \
+        --dist-timeout "$dist_timeout" \
+        --watchdog-timeout "$watchdog_timeout" \
+        --soft-watchdog-timeout "$soft_watchdog_timeout" \
         --moe-runner-backend marlin \
         --attention-backend flashinfer \
         --prefill-attention-backend flashinfer \
