@@ -142,19 +142,35 @@ echo "K3 is ready for user requests and will remain active until job termination
 # AUTOMATIC BENCHMARK TRIGGER
 # Executed immediately after the server is confirmed healthy
 # ==============================================================================
+engram_dir=/scratch/07980/sli4/Engram
+benchmark_log="$engram_dir/log/evaluation_kimi.log"
 echo "🚀 Triggering run_evaluation_kimi automatically..."
-(
-    cd /scratch/07980/sli4/Engram
-    chmod +x playground/graph_rag/run_evaluation_kimi.sh
-    nohup ./playground/graph_rag/run_evaluation_kimi.sh "$SLURM_JOB_ID" >> log/evaluation_kimi.log 2>&1
-) &
+chmod +x "$engram_dir/playground/graph_rag/run_evaluation_kimi.sh"
+# setsid gives the benchmark its own process group (the runner, the LightRAG API and
+# the benchmark itself), so it can be stopped as a whole when the server step ends.
+setsid bash -c 'cd "$1" && exec ./playground/graph_rag/run_evaluation_kimi.sh "$2" >> "$3" 2>&1' \
+    _ "$engram_dir" "$SLURM_JOB_ID" "$benchmark_log" &
 BENCHMARK_PID=$!
 echo "Benchmark running in background (PID $BENCHMARK_PID)."
-echo "Logs available at: /scratch/07980/sli4/Engram/log/evaluation_kimi.log"
+echo "Logs available at: $benchmark_log"
 # ==============================================================================
 
 server_status=0
 wait "$server_step_pid" || server_status=$?
+
+# Without the server every benchmark request fails, and PageIndex retries each one
+# 10 times. Stop the benchmark here with one line in its log instead. Its state files
+# are written atomically, so the next job resumes from the last finished chunk or case.
+if kill -0 "$BENCHMARK_PID" 2>/dev/null; then
+    echo "K3 server step exited (status $server_status); stopping the benchmark."
+    echo "[$(date '+%F %T')] K3 server of job $SLURM_JOB_ID exited (status $server_status); benchmark stopped. Progress is saved; the next job resumes." >> "$benchmark_log"
+    kill -TERM -- "-$BENCHMARK_PID" 2>/dev/null || true
+    for _ in $(seq 15); do
+        kill -0 -- "-$BENCHMARK_PID" 2>/dev/null || break
+        sleep 1
+    done
+    kill -KILL -- "-$BENCHMARK_PID" 2>/dev/null || true
+fi
 if kill -0 "$gpu_monitor_pid" 2>/dev/null; then
     kill "$gpu_monitor_pid" 2>/dev/null || true
     wait "$gpu_monitor_pid" 2>/dev/null || true

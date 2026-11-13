@@ -18,6 +18,7 @@ is the operational runbook.
 | `slurm/serve_k3_32gh.sbatch` | Legacy 32-node serving job |
 | `slurm/server_k3_auto_kimi.sbatch` | Serving job (4 nodes by default, or 8) that also runs the Engram Kimi benchmark |
 | `scripts/launch_k3_rank.sh` | Per-node SGLang launcher that `srun` starts on every node |
+| `scripts/hang_catcher.sh` | Per-node hang catcher the launcher starts: native thread stacks and InfiniBand counters when a rank stalls |
 | `scripts/preflight.sh` | Validate the image, index, and all checkpoint shards |
 | `scripts/chat.py`, `chat.sh` | Streaming multi-turn client and convenience wrapper |
 | `scripts/context_probe.py` | Exact-token long-context recall test |
@@ -109,9 +110,9 @@ runs the Engram Kimi benchmark (PageIndex vs. LightRAG) inside the same job.
 
 **Before the first run**
 
-- **Engram checkout.** The job runs the benchmark from the Engram path hardcoded
-  near the end of the sbatch script (`cd /scratch/07980/sli4/Engram`). Edit that
-  line and the `Logs available at` line below it if your checkout is elsewhere.
+- **Engram checkout.** The job runs the benchmark from the Engram path set near the
+  end of the sbatch script (`engram_dir=/scratch/07980/sli4/Engram`). Edit that
+  line if your checkout is elsewhere.
   That checkout needs its environment installed (`uv sync`), a `.env` with the
   Tejas embedding settings, and the benchmark data. See
   `playground/graph_rag/README.md` in Engram.
@@ -167,6 +168,9 @@ queue, use `scontrol update JobId=JOBID TimeLimit=04:00:00`.
 3. Starts Engram's `playground/graph_rag/run_evaluation_kimi.sh JOBID` in the
    background. The benchmark checkpoints its progress, so the next job resumes
    where this one stopped.
+4. If the server step exits early (a crash, or the watchdog after a hang), stops
+   the benchmark and adds one line saying so to `evaluation_kimi.log`. The job
+   then ends, which frees the nodes.
 
 **Follow progress**
 
@@ -250,6 +254,7 @@ logs/JOBID/
 ├── k3-server.out
 ├── k3-rank-0.out ... k3-rank-N.out   # one per node
 ├── nccl_trace_rank*                # only after an NCCL timeout
+├── hang-capture/rankN-M/          # only if the soft watchdog fires while serving
 ├── k3-gpu-monitor.out
 ├── k3-gpu.csv
 ├── k3-chat.csv                 # after interactive chat
@@ -269,7 +274,7 @@ Download jobs follow the same directory rule with a workload-specific filename.
 | GPU memory remains high after a request | Finished radix/Mamba/CUDA cache can remain reserved; inspect trends rather than one sample |
 | OOM or Marlin workspace failure | Keep the 0.80 memory fraction and 8K prefill chunk the launcher uses; avoid retained-cache stress until idle |
 | One rank exits | Inspect the matching `k3-rank-RANK.out`; `srun --kill-on-bad-exit` will stop the distributed step |
-| Server stops making progress after about 75–80 minutes (an NCCL all-reduce hangs) | Not yet fixed. Each `k3-rank-*.out` should contain `soft_watchdog_timeout` py-spy dumps for its stuck ranks (`grep -n "Pyspy dump" logs/JOBID/k3-rank-*.out`), and `logs/JOBID/nccl_trace_rank*` holds each rank's recent collectives. Compare collective sequence numbers across ranks to find the one that fell behind. To change the timeouts (240/600/900 s by default), export `KIMI_SOFT_WATCHDOG_TIMEOUT`, `KIMI_DIST_TIMEOUT` or `KIMI_WATCHDOG_TIMEOUT` before `sbatch` |
+| Server stops making progress 75 minutes to about 2 h 20 min after start (an NCCL all-reduce hangs) | Not yet fixed. In jobs 91870 and 92084, TP11's CPU was stuck in `ncclLocalOpAppend`: NCCL's proxy thread had stopped draining its queue, and the other ranks waited for it. Three sources of evidence: (1) `grep -n "Pyspy dump" logs/JOBID/k3-rank-*.out` shows each rank's Python stack (dumps during weight loading at startup are normal); (2) `logs/JOBID/nccl_trace_rank*` are PyTorch flight-recorder pickles, and the rank whose `last_enqueued_collective` is lowest is the one that fell behind; (3) `logs/JOBID/hang-capture/rankN-M/` comes from `scripts/hang_catcher.sh`, which, when the soft watchdog fires while serving, saves every thread's state, CPU time over 5 s and native gdb stack (NCCL's proxy thread included), plus InfiniBand counter changes and `nvidia-smi`. Timeouts (240/600/900 s by default): `KIMI_SOFT_WATCHDOG_TIMEOUT`, `KIMI_DIST_TIMEOUT`, `KIMI_WATCHDOG_TIMEOUT`. `KIMI_HANG_CATCHER=0` turns the catcher off. Lines longer than 4,000 characters in `k3-rank-*.out` (the watchdog's `leaked_full_pages` sets and request `input_ids`) are cut, with a note saying how much; `KIMI_LOG_LINE_MAX` changes the limit |
 
 Horizon's Grace Blackwell nodes use the GB200 NVL4 platform. Each node has 4
 Blackwell GPUs with 185 GiB of HBM3 each, and 2 Grace CPUs with 478 GiB of LPDDR5X

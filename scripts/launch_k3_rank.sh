@@ -103,6 +103,34 @@ export APPTAINERENV_NCCL_TIMEOUT=7200
 echo "rank=$node_rank host=$(hostname) ib=$host_ip master=$master_addr tvm_ffi_cache=$host_tvm_ffi_cache model_load_threads=$model_load_threads shard_stagger=1"
 echo "timeouts: soft_watchdog=${soft_watchdog_timeout}s dist=${dist_timeout}s watchdog=${watchdog_timeout}s"
 
+# Per-node hang catcher. py-spy shows only Python threads, but jobs 91870 and 92084
+# both stalled in NCCL's proxy thread (plain C). When this node's soft watchdog
+# fires while serving, the catcher saves every thread's state and native stack,
+# plus InfiniBand counters, under logs/JOBID/hang-capture/. The exec below keeps
+# this PID ($$), so the catcher stops when the server exits. KIMI_HANG_CATCHER=0
+# turns it off.
+if [[ "${KIMI_HANG_CATCHER:-1}" == 1 && -n "${KIMI_JOB_LOG_DIR:-}" ]]; then
+    "$script_dir/hang_catcher.sh" "$KIMI_JOB_LOG_DIR/k3-rank-${node_rank}.out" "$$" \
+        "$KIMI_JOB_LOG_DIR/hang-capture" "$image_path" "$node_rank" &
+fi
+
+# Each watchdog dump makes SGLang print a few lines that are megabytes long: the
+# invariant checker's leaked_full_pages set (every page a running request holds)
+# and the full input_ids of each running request. In job 92084 they pushed every
+# rank log to 32 MB. Cut any line longer than KIMI_LOG_LINE_MAX characters (default
+# 4000) and note how much was cut. stdout and stderr share the one filter, so their
+# order is kept.
+log_line_max=${KIMI_LOG_LINE_MAX:-4000}
+if ! [[ "$log_line_max" =~ ^[1-9][0-9]*$ ]]; then
+    echo "KIMI_LOG_LINE_MAX must be a positive integer; got $log_line_max." >&2
+    exit 2
+fi
+exec > >(LC_ALL=C awk -v max="$log_line_max" '{
+    if (length($0) > max) print substr($0, 1, max) " ...[" length($0) - max " more characters cut by launch_k3_rank.sh]"
+    else print
+    fflush()
+}') 2>&1
+
 # Vista's GH200 nodes expose one 96 GiB Hopper GPU each.  This adapts SGLang's
 # published 32-GPU H100 TP32/EP32 profile to 32 single-GPU, 400-Gb/s-IB nodes.
 # CUDA graphs are disabled for first bring-up; benchmark before enabling them.
